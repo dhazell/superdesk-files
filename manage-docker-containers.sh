@@ -3,41 +3,60 @@
 
 [ "`whoami`" == "superdesk" ] || exit #only run this script if logged in as superdesk
 action=$1
-script="superdesk/scripts/docker-local-aap.sh"
+HOME=/home/superdesk
+script="$HOME/superdesk/scripts/docker-local-aap.sh"
 logfile="$script.log"
-ScriptVersion=0.9.92
-cd /home/superdesk
+ScriptVersion=0.9.93
+cd $HOME
 
-function destroy-containers ()
+function containers-destroy ()
 {
- echo about to stop and delete any containers and rename old $logfile logfile if it exists
- if [ "`docker ps -aq`" != "" ]; then
-   echo stopping running containers ...
-   docker stop $(docker ps -q) # > /dev/null
-   echo deleting all containers ...
-   docker rm $(docker ps -aq)  # > /dev/null
-   sleep 5
+ echo "about to stop and delete any containers and rename old $logfile logfile if it exists"
+ if [ -f $HOME/superdesk/docker/docker-compose.yml ]; then
+   cd $HOME/superdesk/docker
+   if [ "`docker-compose ps`" != "" ]; then
+     containers-stop
+     containers-rm
+     sleep 5
+   fi
+   cd $HOME
+  else
+   echo "Superdesk is not currently installed as no docker-compose.yml file exists"
+   echo "About to delete the following containers: "
+   for instance in $(docker ps -q); do 
+     echo -n "$instance "
+    done
+   echo ""
+   echo "Are you sure: [yN]"
+   read x
+   [ $x == "y" ] || exit
+   for instance in $(docker ps -q); do 
+     docker stop $instance
+     docker rm $instance
+    done
  fi
+ containers-status
  [ -f $logfile ] && mv $logfile $logfile-$(date '+%C%y%m%d.%H%M%S')
 }
 
-function build-containers ()
+function containers-build ()
 {
- echo about to build a new set of docker containers for Superdesk from scratch
+ echo "about to build a new set of docker containers for Superdesk from scratch"
 
  #get sudo rights before continuing
  sudo -s exit
  [ $? -ne 0 ] && exit #dont continue unless sudo is happy
 
  #clear out old containers
- destroy-containers
+ containers-destroy
 
  #save old file superdesk filetree
- echo about to archive old superdesk filetree
+ echo "about to archive old superdesk filetree"
  echo "(note that existing elastic mongodb and redis data is left in original location for use later)"
- [ -d superdesk ] && mv superdesk superdesk-$(date '+%C%y%m%d.%H%M%S')
+ [ -d $HOME/superdesk ] && mv $HOME/superdesk $HOME/superdesk-$(date '+%C%y%m%d.%H%M%S')
 
  #clone superdesk repo from git
+ rm -rf $HOME/superdesk
  git clone https://github.com/superdesk/superdesk.git
 
  #install python-virtualenv if not already installed , if already installed then no problem
@@ -67,18 +86,80 @@ function build-containers ()
  cp -p superdesk/scripts/docker-local-demo.sh $script
 
  #run the scripts and build the docker environment
- runScripts
+ run-docker-compose    #run the docker-compose script
+ wait-until-superdesk-is-running
+ superdesk-init-env #initialise the superdesk environment
 }
 
-function runScripts ()
+function containers-rebuild ()
 {
- echo about to run the $script script and then the script to intialise environment
+ echo "about to run the $script script but don't init environment"
+ run-docker-compose            #run the docker-compose script
+ wait-until-superdesk-is-running
+}
+
+function containers-start ()
+{
+ echo "about to start the containers referenced by the superdesk/docker/docker-compose.yml script"
+ cd $HOME/superdesk/docker
+ docker-compose up --timeout 600 2>&1 > $logfile 2>&1 &
+ cd $HOME
+ wait-until-superdesk-is-running
+}
+
+function containers-rm () {
+ echo "about to remove the containers referenced by the superdesk/docker/docker-compose.yml script"
+ script-status
+ if [ -f $HOME/superdesk/docker/docker-compose.yml ]; then
+   echo "About to run: docker-compose rm"
+   cd $HOME/superdesk/docker
+   docker-compose rm
+   cd $HOME
+  else
+   echo "Superdesk is not currently installed as no docker-compose.yml exists"
+   for instance in $(docker ps -q); do docker rm $instance; done  # rm any containers
+ fi
+}
+
+function containers-stop () {
+ echo "about to stop the containers referenced by the superdesk/docker/docker-compose.yml script"
+ script-status
+ if [ -f $HOME/superdesk/docker/docker-compose.yml ]; then
+   echo "About to run: docker-compose stop"
+   cd $HOME/superdesk/docker
+   docker-compose stop
+   cd $HOME
+  else
+   echo "Superdesk is not currently installed as no docker-compose.yml exists"
+   for instance in $(docker ps -q); do docker stop $instance; done  # stop any running containers
+ fi
+}
+
+function containers-kill () {
+ echo "about to kill the containers referenced by the superdesk/docker/docker-compose.yml script"
+ script-status
+ if [ -f $HOME/superdesk/docker/docker-compose.yml ]; then
+   echo "About to run: docker-compose kill"
+   cd $HOME/superdesk/docker
+   docker-compose kill
+   cd $HOME
+  else
+   echo "Superdesk is not currently installed as no docker-compose.yml exists"
+   for instance in $(docker ps -q); do docker kill $instance; done  # kill any running containers
+ fi
+}
+
+function run-docker-compose ()
+{
+ echo "about to run the $script script and then the script to intialise environment"
 
  #run the $script script to build the containers
- status-script
- local PID="`findpid`"
+ script-status
+ local PID="`find-pid`"
  if [ $PID -gt 0 ]; then
    echo "$script script is already running (PID:$PID), so exiting"
+   echo "Try: $0 containers-stop."
+   echo "Then reattempt the build or rebuild of the superdesk environment."
    exit
   else
    for instance in $(docker ps -q); do docker stop $instance; done  # stop running containers if they exist
@@ -86,54 +167,49 @@ function runScripts ()
    $script 2>&1 > $logfile 2>&1 &
    sleep 2
    echo "system is starting ..."
-   status-script
+   script-status
    echo -e "\nFor more information, in another shell, tail the logfile :\ncd ~\ntail -100f $logfile"
  fi
+}
 
+function wait-until-superdesk-is-running ()
+{
  #wait until system is built (ie 'Done, without errors.' is seen in the logfile) before continung
- while [ "`cat superdesk/scripts/docker-local-aap.sh.log | grep 'Done, without errors.'`" == "" ]; do
+ while [ "`cat $logfile | grep 'Done, without errors.'`" == "" ]; do
    echo -n "."
    sleep 1
   done
- echo waiting a minute before initializing the docker environment
- sleep 60
-
- #run the script to initialize the environment
- echo about to initialize setup
- ./superdesk/scripts/docker-initial-setup.sh
- echo setup initialized
+ #sleep 60
 }
 
-function rebuild-containers ()
+function superdesk-init-env ()
 {
- echo about to call the runScripts funciton to run the $script script and then intialise environment
- runScripts
+ #run the script to initialize the environment
+ echo "about to initialize setup"
+ ./superdesk/scripts/docker-initial-setup.sh
+ echo "setup initialized"
 }
 
-function findpid () {
+function find-pid () {
  #figure out PID of $script
  local PID="`ps -ef | egrep "/bin/bash" | egrep "$script" | egrep -v egrep | awk '{print $2}' | head -1`" #note head -1 is not ideal but used to overcome rare situation where there is more than one matching line
  [ "$PID" == "" ] && PID=-1
  echo $PID
 }
 
-function stop-containers () {
- status-script
- for instance in $(docker ps -q); do docker stop $instance; done  # stop running containers if they exist
-}
-
-function kill-containers () {
- status-script
- for instance in $(docker ps -q); do docker kill $instance; done  # kill running containers if they exist
-}
-
-function status-containers ()
+function containers-status ()
 {
+ echo "#####################"
+ echo "LIST RUNNING CONTAINERS"
  docker ps
+ echo "#####################"
+ echo "LIST ALL CONTAINERS:"
+ docker ps -a
+ echo "#####################"
 }
 
-function status-script () {
- local PID="`findpid`"
+function script-status () {
+ local PID="`find-pid`"
  #[ "$PID" == "0" ] && echo "script: $script is running (PID:$PID)"
  #[ "$PID" == "0" ] || echo "script: $script is NOT running"
  [ $PID -gt 0 ] && echo "script: $script is running (PID:$PID)"
@@ -142,27 +218,30 @@ function status-script () {
 
 function usage () {
  echo "Usage : $0"
- echo "   eg : $0 build-containers   #used to build the docker environment (clones from git, and builds from new repo, and runs and initializes the docker environment)"
- echo "   eg : $0 rebuild-containers #used to rebuild the docker environment (runs and initializes the docker environment)"
- echo "   eg : $0 stop-containers    #used to stop the containers in ihe docker environment"
- echo "   eg : $0 status-containers  #used to get status of the docker environment"
- echo "   eg : $0 status-script      #used to get status of the $script used to start docker environment"
- echo "   eg : $0 destroy-containers #used to destroy the docker environment"
+ echo "   eg : $0 containers-build       #used to   build superdesk environment (clones from git, builds containers, connects containers together, initializes superdesk environment)"
+ echo "   eg : $0 containers-rebuild     #used to rebuild superdesk environment (                 builds containers, connects containers together)"
  echo ""
- echo "      : Use command below with extra care as risk of corrupting data"
- echo "   eg : $0 kill-containers    #used to kill but not delete the containers in the docker environment"
+ echo "   eg : $0 containers-start       #used to   start the containers in the superdesk environment"
+ echo "   eg : $0 containers-stop        #used to    stop the containers in ihe superdesk environment"
+ echo "   eg : $0 containers-destroy     #used to destroy the containers in the superdesk environment"
+ echo ""
+ echo "   eg : $0 superdesk-init-env     #used to initialise the superdesk environment"
+ echo ""
+ echo "   eg : $0 containers-status      #used to get status of superdesk containers"
+ echo "   eg : $0 script-status          #used to get status of $script used to start superdesk environment"
 }
 
 #main
 echo "ScriptVersion is $ScriptVersion"
 case $action in
- build-containers   ) build-containers;;
- rebuild-containers ) rebuild-containers;;
- stop-containers    ) stop-containers;;
- status-containers  ) status-containers;;
- status-script      ) status-script;;
- destroy-containers ) destroy-containers;;
- kill-containers    ) kill-containers;;
- *                  ) usage;;
+ containers-build       ) containers-build;;
+ containers-rebuild     ) containers-rebuild;;
+ containers-start       ) containers-start;;
+ containers-stop        ) containers-stop;;
+ superdesk-init-env     ) superdesk-init-env;;
+ containers-destroy     ) containers-destroy;;
+ containers-status      ) containers-status;;
+ script-status          ) script-status;;
+ *                      ) usage;;
 esac
 
